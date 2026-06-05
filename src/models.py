@@ -24,7 +24,7 @@ class Constructor(Base):
     
     # relationships
     results = relationship('RaceResult', back_populates='constructor')
-    qualifying = relationship('QualifyingResult', back_populates='constructor')
+    
 
 class Circuit(Base):
     __tablename__ = 'circuits'
