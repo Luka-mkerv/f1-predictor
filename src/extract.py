@@ -18,7 +18,7 @@ def save_drivers(race_results_df, session):
         existing = session.query(Driver).filter_by(driver_id=row['DriverId']).first()
         if not existing:
             driver = Driver(
-                driver_id=row['DriverId'],
+                driver_id=row['Driver'],
                 name=row['FullName'],
                 nationality=row['CountryCode']
             )
@@ -124,9 +124,14 @@ def save_weather(race_id, weather_df, session):
     print(f"Weather saved for race_id {race_id}")
 
 
-def save_tyres(race_id, laps_df, session):
+def save_tyres(race_id, laps_df, race_results_df, session):
     if laps_df.empty:
         return
+
+    # Map driver number to driver_id
+    number_to_id = dict(zip(race_results_df['DriverNumber'].astype(str), race_results_df['DriverId']))
+    laps_df = laps_df.copy()
+    laps_df['DriverId'] = laps_df['Driver'].map(number_to_id)
 
     stints = laps_df.groupby(['DriverId', 'Stint']).agg(
         compound=('Compound', 'first'),
@@ -144,7 +149,6 @@ def save_tyres(race_id, laps_df, session):
         session.add(stint)
     session.commit()
     print(f"Tyre stints saved for race_id {race_id}")
-
 
 def extract_race(year: int, round_number: int, session: object):
     print(f"\nExtracting round {round_number} of {year}...")
@@ -164,19 +168,28 @@ def extract_race(year: int, round_number: int, session: object):
     save_race_results(race_id, race.results, session)
     save_qualifying(race_id, quali.results, session)
     save_weather(race_id, race.weather_data, session)
-    save_tyres(race_id, race.laps, session)
+    save_tyres(race_id, race.laps, race.results, session)
 
     print(f"Done: {race.event['EventName']}")
 
 
-def extract_season(year: int):
+ddef extract_season(year: int):
     print(f"Starting extraction for {year} season...")
     session = Session()
 
     try:
         schedule = fastf1.get_event_schedule(year, include_testing=False)
         print(f"Found {len(schedule)} races in {year}")
+        
         for round_number in range(1, len(schedule) + 1):
+            # Skip if already extracted
+            existing = session.query(Race).filter_by(
+                season=year, round=round_number
+            ).first()
+            if existing:
+                print(f"Round {round_number} already extracted, skipping...")
+                continue
+            
             extract_race(year, round_number, session)
     except Exception as e:
         print(f"Error: {e}")
