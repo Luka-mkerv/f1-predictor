@@ -73,6 +73,12 @@ def save_race(event, year, round_number, session):
 
 def save_race_results(race_id, race_results_df, session):
     for _, row in race_results_df.iterrows():
+        existing = session.query(RaceResult).filter_by(
+            race_id=race_id, driver_id=row['DriverId']
+        ).first()
+        if existing:
+            continue
+
         result = RaceResult(
             race_id=race_id,
             driver_id=row['DriverId'],
@@ -90,6 +96,12 @@ def save_race_results(race_id, race_results_df, session):
 
 def save_qualifying(race_id, quali_results_df, session):
     for _, row in quali_results_df.iterrows():
+        existing = session.query(QualifyingResult).filter_by(
+            race_id=race_id, driver_id=row['DriverId']
+        ).first()
+        if existing:
+            continue
+
         def lap_to_seconds(t):
             if pd.isna(t):
                 return None
@@ -110,6 +122,10 @@ def save_qualifying(race_id, quali_results_df, session):
 
 def save_weather(race_id, weather_df, session):
     if weather_df.empty:
+        return
+    
+    existing = session.query(Weather).filter_by(race_id=race_id).first()
+    if existing:
         return
 
     weather = Weather(
@@ -173,7 +189,7 @@ def extract_race(year: int, round_number: int, session: object):
     print(f"Done: {race.event['EventName']}")
 
 
-ddef extract_season(year: int):
+def extract_season(year: int):
     print(f"Starting extraction for {year} season...")
     session = Session()
 
