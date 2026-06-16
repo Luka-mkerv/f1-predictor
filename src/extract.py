@@ -13,12 +13,20 @@ fastf1.Cache.enable_cache(cache_dir)
 Session = sessionmaker(bind=engine)
 
 
+def _valid_driver_id(driver_id) -> bool:
+    if pd.isna(driver_id):
+        return False
+    return str(driver_id).strip().lower() not in ('', 'nan', 'none')
+
+
 def save_drivers(race_results_df, session):
     for _, row in race_results_df.iterrows():
+        if not _valid_driver_id(row['DriverId']):
+            continue
         existing = session.query(Driver).filter_by(driver_id=row['DriverId']).first()
         if not existing:
             driver = Driver(
-                driver_id=row['Driver'],
+                driver_id=row['DriverId'],
                 name=row['FullName'],
                 nationality=row['CountryCode']
             )
@@ -94,10 +102,22 @@ def save_race_results(race_id, race_results_df, session):
     print(f"Race results saved for race_id {race_id}")
 
 
-def save_qualifying(race_id, quali_results_df, session):
+def save_qualifying(race_id, quali_results_df, race_results_df, session):
+    number_to_id = dict(zip(
+        race_results_df['DriverNumber'].astype(str),
+        race_results_df['DriverId'],
+    ))
+
     for _, row in quali_results_df.iterrows():
+        driver_id = row['DriverId']
+        if not _valid_driver_id(driver_id):
+            driver_id = number_to_id.get(str(row['DriverNumber']))
+        if not _valid_driver_id(driver_id):
+            print(f"Skipping qualifying for driver number {row['DriverNumber']} — no valid driver_id")
+            continue
+
         existing = session.query(QualifyingResult).filter_by(
-            race_id=race_id, driver_id=row['DriverId']
+            race_id=race_id, driver_id=driver_id
         ).first()
         if existing:
             continue
@@ -109,7 +129,7 @@ def save_qualifying(race_id, quali_results_df, session):
 
         qualifying = QualifyingResult(
             race_id=race_id,
-            driver_id=row['DriverId'],
+            driver_id=driver_id,
             q1_time=lap_to_seconds(row['Q1']),
             q2_time=lap_to_seconds(row['Q2']),
             q3_time=lap_to_seconds(row['Q3']),
@@ -140,31 +160,47 @@ def save_weather(race_id, weather_df, session):
     print(f"Weather saved for race_id {race_id}")
 
 
-def save_tyres(race_id, laps_df, race_results_df, session):
+def save_tyre_stints(race_id, laps_df, race_results_df, session):
     if laps_df.empty:
         return
 
-    # Map driver number to driver_id
-    number_to_id = dict(zip(race_results_df['DriverNumber'].astype(str), race_results_df['DriverId']))
+    number_to_id = dict(zip(
+        race_results_df['DriverNumber'].astype(str),
+        race_results_df['DriverId'],
+    ))
     laps_df = laps_df.copy()
-    laps_df['DriverId'] = laps_df['Driver'].map(number_to_id)
+    laps_df['DriverId'] = laps_df['DriverNumber'].astype(str).map(number_to_id)
+    laps_df = laps_df.dropna(subset=['DriverId'])
 
     stints = laps_df.groupby(['DriverId', 'Stint']).agg(
         compound=('Compound', 'first'),
-        laps_on_tyre=('LapNumber', 'count')
+        laps_on_tyre=('LapNumber', 'count'),
     ).reset_index()
 
+    saved = 0
     for _, row in stints.iterrows():
+        stint_number = int(row['Stint'])
+        existing = session.query(TyreStint).filter_by(
+            race_id=race_id,
+            driver_id=row['DriverId'],
+            stint_number=stint_number,
+        ).first()
+        if existing:
+            continue
+
         stint = TyreStint(
             race_id=race_id,
             driver_id=row['DriverId'],
-            stint_number=int(row['Stint']),
+            stint_number=stint_number,
             compound=row['compound'],
-            laps_on_tyre=int(row['laps_on_tyre'])
+            laps_on_tyre=int(row['laps_on_tyre']),
         )
         session.add(stint)
-    session.commit()
-    print(f"Tyre stints saved for race_id {race_id}")
+        saved += 1
+
+    if saved:
+        session.commit()
+        print(f"Tyre stints saved for race_id {race_id} ({saved} new)")
 
 def extract_race(year: int, round_number: int, session: object):
     print(f"\nExtracting round {round_number} of {year}...")
@@ -182,11 +218,33 @@ def extract_race(year: int, round_number: int, session: object):
     save_circuit(event, session)
     race_id = save_race(event, year, round_number, session)
     save_race_results(race_id, race.results, session)
-    save_qualifying(race_id, quali.results, session)
+    save_qualifying(race_id, quali.results, race.results, session)
     save_weather(race_id, race.weather_data, session)
-    save_tyres(race_id, race.laps, race.results, session)
+    save_tyre_stints(race_id, race.laps, race.results, session)
 
     print(f"Done: {race.event['EventName']}")
+
+
+def backfill_tyre_stints(years: list[int] | None = None):
+    session = Session()
+    try:
+        query = session.query(Race).order_by(Race.season, Race.round)
+        if years:
+            query = query.filter(Race.season.in_(years))
+        races = query.all()
+
+        for race in races:
+            existing = session.query(TyreStint).filter_by(race_id=race.race_id).first()
+            if existing:
+                print(f"Tyre stints already exist for {race.season} R{race.round}, skipping...")
+                continue
+
+            print(f"Backfilling tyre stints for {race.season} round {race.round}...")
+            ff1_race = fastf1.get_session(race.season, race.round, 'R')
+            ff1_race.load()
+            save_tyre_stints(race.race_id, ff1_race.laps, ff1_race.results, session)
+    finally:
+        session.close()
 
 
 def extract_season(year: int):
@@ -198,14 +256,6 @@ def extract_season(year: int):
         print(f"Found {len(schedule)} races in {year}")
         
         for round_number in range(1, len(schedule) + 1):
-            # Skip if already extracted
-            existing = session.query(Race).filter_by(
-                season=year, round=round_number
-            ).first()
-            if existing:
-                print(f"Round {round_number} already extracted, skipping...")
-                continue
-            
             extract_race(year, round_number, session)
     except Exception as e:
         print(f"Error: {e}")
@@ -214,5 +264,24 @@ def extract_season(year: int):
 
 
 if __name__ == "__main__":
-    for year in [2023, 2024, 2025]:
-        extract_season(year)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Extract F1 data into the database")
+    parser.add_argument(
+        "--backfill-tyres",
+        action="store_true",
+        help="Backfill tyre_stints for races already in the database",
+    )
+    parser.add_argument(
+        "--years",
+        nargs="+",
+        type=int,
+        default=[2023, 2024, 2025],
+    )
+    args = parser.parse_args()
+
+    if args.backfill_tyres:
+        backfill_tyre_stints(args.years)
+    else:
+        for year in args.years:
+            extract_season(year)
